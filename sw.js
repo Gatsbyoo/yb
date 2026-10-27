@@ -1,15 +1,23 @@
-/* 离线缓存策略：stale-while-revalidate
-   - 有缓存就立刻返回 → 超市里没信号也是秒开
-   - 同时后台拉新版本写回缓存 → 下次打开就是最新的
-   关键：不能用 cache-first，否则改了代码用户永远收不到更新 */
-var CACHE = 'chisha-v2';
+/* 离线缓存：stale-while-revalidate
+   - 有缓存就立刻用 → 打开即开，不用等网络
+   - 后台同时拉新版本写回缓存 → 下次打开就是最新的
+   不能用 cache-first：那样改了代码用户永远收不到更新（做菜那版踩过这个坑） */
+
+var CACHE = 'xiaorizi-v1';
 
 var ASSETS = [
   './',
   './index.html',
   './css/style.css',
-  './js/data.js',
-  './js/app.js',
+  './js/core.js',
+  './js/mod-todo.js',
+  './js/mod-bill.js',
+  './js/mod-day.js',
+  './js/mod-diary.js',
+  './js/mod-habit.js',
+  './js/mod-cycle.js',
+  './js/mod-wheel.js',
+  './js/shell.js',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -29,7 +37,7 @@ self.addEventListener('activate', function (e) {
     caches.keys()
       .then(function (keys) {
         return Promise.all(keys.map(function (k) {
-          return k === CACHE ? null : caches.delete(k);
+          if (k !== CACHE) return caches.delete(k);
         }));
       })
       .then(function () { return self.clients.claim(); })
@@ -37,28 +45,46 @@ self.addEventListener('activate', function (e) {
 });
 
 self.addEventListener('fetch', function (e) {
-  if (e.request.method !== 'GET') return;
+  var req = e.request;
+  if (req.method !== 'GET') return;
 
-  var url;
-  try { url = new URL(e.request.url); } catch (err) { return; }
-  if (url.origin !== self.location.origin) return;
+  var url = new URL(req.url);
+  if (url.origin !== location.origin) return;
+
+  /* 做菜那个应用有自己的 service worker，这里不插手 */
+  if (url.pathname.indexOf('/cook/') !== -1) return;
+
+  /* 页面导航：先网络，失败给离线壳 */
+  if (req.mode === 'navigate') {
+    e.respondWith(
+      fetch(req)
+        .then(function (res) {
+          var copy = res.clone();
+          caches.open(CACHE).then(function (c) { c.put('./index.html', copy); });
+          return res;
+        })
+        .catch(function () {
+          return caches.match('./index.html').then(function (r) {
+            return r || caches.match('./');
+          });
+        })
+    );
+    return;
+  }
 
   e.respondWith(
-    caches.open(CACHE).then(function (cache) {
-      return cache.match(e.request).then(function (hit) {
-        var fresh = fetch(e.request).then(function (res) {
+    caches.match(req).then(function (cached) {
+      var network = fetch(req)
+        .then(function (res) {
           if (res && res.status === 200 && res.type === 'basic') {
-            cache.put(e.request, res.clone()).catch(function () {});
+            var copy = res.clone();
+            caches.open(CACHE).then(function (c) { c.put(req, copy); });
           }
           return res;
-        }).catch(function () {
-          // 网络彻底失败：导航请求退回首页
-          if (e.request.mode === 'navigate') return cache.match('./index.html');
-          return hit;
-        });
+        })
+        .catch(function () { return cached; });
 
-        return hit || fresh;
-      });
+      return cached || network;
     })
   );
 });

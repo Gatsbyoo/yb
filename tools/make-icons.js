@@ -1,5 +1,6 @@
 /* 零依赖生成 PWA 图标
-   用 Node 内置 zlib 直接编码 PNG，不依赖 sharp / canvas / PIL
+   机器上没有 sharp / canvas / PIL，用 Node 内置 zlib 直接编码 PNG。
+   图形：暖色圆角底 + 2x2 白色格子（读作「一堆小工具」）
    用法：node tools/make-icons.js
 */
 'use strict';
@@ -49,7 +50,7 @@ function encodePNG(width, height, rgba) {
   const stride = width * 4;
   const raw = Buffer.alloc((stride + 1) * height);
   for (let y = 0; y < height; y++) {
-    raw[y * (stride + 1)] = 0; // filter: none
+    raw[y * (stride + 1)] = 0;
     rgba.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
   }
 
@@ -62,72 +63,49 @@ function encodePNG(width, height, rgba) {
 const lerp = (a, b, t) => a + (b - a) * t;
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
-function inRoundRect(x, y, r) {
-  const cx = clamp(x, r, 1 - r);
-  const cy = clamp(y, r, 1 - r);
+function inRoundRect(x, y, r) { return inRoundRectBox(x, y, 0, 0, 1, 1, r); }
+
+function inRoundRectBox(x, y, x0, y0, x1, y1, r) {
+  if (x < x0 || x > x1 || y < y0 || y > y1) return false;
+  const cx = clamp(x, x0 + r, x1 - r);
+  const cy = clamp(y, y0 + r, y1 - r);
   const dx = x - cx;
   const dy = y - cy;
   return dx * dx + dy * dy <= r * r + 1e-12;
 }
 
-function segDist(px, py, ax, ay, bx, by) {
-  const vx = bx - ax, vy = by - ay;
-  const wx = px - ax, wy = py - ay;
-  const vv = vx * vx + vy * vy;
-  const t = vv === 0 ? 0 : clamp((wx * vx + wy * vy) / vv, 0, 1);
-  const dx = px - (ax + t * vx);
-  const dy = py - (ay + t * vy);
-  return Math.sqrt(dx * dx + dy * dy);
-}
+/* ---------- 图形 ---------- */
 
-/* ---------- 图形：暖色背景 + 一只白碗 + 三道热气 ---------- */
+const BG_TOP = [212, 110, 76];
+const BG_BOT = [176, 74, 46];
+const TILE = [255, 253, 248];
 
-const BG_TOP = [246, 133, 85];
-const BG_BOT = [218, 71, 38];
-const WHITE = [255, 252, 246];
+/* 2x2 格子：内容占 0.20 ~ 0.80 */
+const T1 = [0.200, 0.460];
+const T2 = [0.540, 0.800];
+const TR = 0.056;
 
-const BOWL_CY = 0.565;
-const BOWL_R = 0.238;
-const RIM_R = 0.030;
-const STEAM = [
-  [0.378, 0.285, 0.378, 0.400, 0.0165],
-  [0.500, 0.225, 0.500, 0.380, 0.0165],
-  [0.622, 0.285, 0.622, 0.400, 0.0165]
-];
-
-/* 返回该采样点的 [r,g,b,a] */
 function sample(u, v, opts) {
   if (opts.radius > 0 && !inRoundRect(u, v, opts.radius)) return [0, 0, 0, 0];
 
-  // 背景竖直渐变
   let cr = lerp(BG_TOP[0], BG_BOT[0], v);
   let cg = lerp(BG_TOP[1], BG_BOT[1], v);
   let cb = lerp(BG_TOP[2], BG_BOT[2], v);
 
-  // 内容缩放（maskable 要留安全区）
+  /* 内容区按 contentScale 缩放，给 maskable 留安全区 */
   const k = opts.contentScale;
   const x = 0.5 + (u - 0.5) / k;
   const y = 0.5 + (v - 0.5) / k;
 
-  const over = (alpha) => {
-    cr = WHITE[0] * alpha + cr * (1 - alpha);
-    cg = WHITE[1] * alpha + cg * (1 - alpha);
-    cb = WHITE[2] * alpha + cb * (1 - alpha);
-  };
+  const inTile =
+    inRoundRectBox(x, y, T1[0], T1[0], T1[1], T1[1], TR) ||
+    inRoundRectBox(x, y, T2[0], T1[0], T2[1], T1[1], TR) ||
+    inRoundRectBox(x, y, T1[0], T2[0], T1[1], T2[1], TR) ||
+    inRoundRectBox(x, y, T2[0], T2[0], T2[1], T2[1], TR);
 
-  // 热气
-  for (let i = 0; i < STEAM.length; i++) {
-    const s = STEAM[i];
-    if (segDist(x, y, s[0], s[1], s[2], s[3]) <= s[4]) over(0.84);
+  if (inTile) {
+    cr = TILE[0]; cg = TILE[1]; cb = TILE[2];
   }
-
-  // 碗口
-  if (segDist(x, y, 0.232, BOWL_CY, 0.768, BOWL_CY) <= RIM_R) over(1);
-
-  // 碗身（下半圆）
-  const dx = x - 0.5;
-  const dy = y - BOWL_CY;
-  if (dy >= 0 && Math.sqrt(dx * dx + dy * dy) <= BOWL_R) over(1);
 
   return [cr, cg, cb, 1];
 }
@@ -174,8 +152,8 @@ if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 const jobs = [
   { file: 'icon-192.png', size: 192, opts: { radius: 0.22, contentScale: 1 } },
   { file: 'icon-512.png', size: 512, opts: { radius: 0.22, contentScale: 1 } },
-  { file: 'icon-maskable-512.png', size: 512, opts: { radius: 0, contentScale: 0.78 } },
-  { file: 'apple-touch-icon.png', size: 180, opts: { radius: 0, contentScale: 0.92 } }
+  { file: 'icon-maskable-512.png', size: 512, opts: { radius: 0, contentScale: 0.76 } },
+  { file: 'apple-touch-icon.png', size: 180, opts: { radius: 0, contentScale: 0.9 } }
 ];
 
 jobs.forEach((j) => {

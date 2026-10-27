@@ -1,163 +1,80 @@
-/* 开发自检工具：通过 CDP 读取真实布局数据，找出横向溢出、元素越界与 JS 报错
-   用法：先起静态服务器，再 node tools/probe.js [url] */
+/* 布局探针：直接量真实尺寸，不靠肉眼判断
+   用法：node tools/probe.js "http://127.0.0.1:8765/index.html#/t/todo" ".pad,#tdBody,.blank" */
 'use strict';
 
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 const { spawn } = require('child_process');
 
-const ROOT = path.join(__dirname, '..');
+const OUT = path.join(__dirname, '..', '_shots');
 const EDGE = process.env.EDGE_PATH || 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe';
-const PORT = 9333;
-const URL_TARGET = process.argv[2] || 'http://127.0.0.1:8765/index.html';
+const PORT = 9353;
+const URL_TARGET = process.argv[2] || 'http://127.0.0.1:8765/index.html#/';
+const SELS = (process.argv[3] || '.view,.toolbody,.pad,.blank').split(',');
 
-const PROFILE = path.join(ROOT, '_shots', 'probe-profile');
-if (!fs.existsSync(PROFILE)) fs.mkdirSync(PROFILE, { recursive: true });
-
-const child = spawn(EDGE, [
-  '--headless=new',
-  '--disable-gpu',
-  '--no-first-run',
-  '--no-default-browser-check',
-  '--window-size=390,900',
-  '--remote-debugging-port=' + PORT,
-  '--user-data-dir=' + PROFILE,
-  'about:blank'
-], { stdio: 'ignore' });
-
+if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function getTarget() {
+const child = spawn(EDGE, ['--headless=new', '--disable-gpu', '--no-proxy-server', '--proxy-bypass-list=*',
+  '--remote-debugging-port=' + PORT, '--user-data-dir=' + path.join(OUT, 'cdp-probe'), 'about:blank'], { stdio: 'ignore' });
+
+(async function () {
+  let wsUrl;
   for (let i = 0; i < 40; i++) {
     try {
-      const res = await fetch('http://127.0.0.1:' + PORT + '/json/list');
-      const list = await res.json();
-      const page = list.find((t) => t.type === 'page');
-      if (page && page.webSocketDebuggerUrl) return page.webSocketDebuggerUrl;
-    } catch (e) { /* 还没起来 */ }
+      const list = await (await fetch('http://127.0.0.1:' + PORT + '/json/list')).json();
+      const p = list.find((t) => t.type === 'page');
+      if (p) { wsUrl = p.webSocketDebuggerUrl; break; }
+    } catch (e) { /* 等端口 */ }
     await sleep(250);
   }
-  throw new Error('连不上调试端口');
-}
 
-const EXPR = `(() => {
-  const vw = window.innerWidth;
-  const out = {
-    viewport: { w: vw, h: window.innerHeight, dpr: window.devicePixelRatio },
-    doc: {
-      clientWidth: document.documentElement.clientWidth,
-      scrollWidth: document.documentElement.scrollWidth,
-      bodyScrollWidth: document.body.scrollWidth,
-      scrollHeight: document.documentElement.scrollHeight
-    },
-    overflow: [],
-    rects: {}
-  };
-  const byText = (sel) => Array.from(document.querySelectorAll(sel));
-
-  // 找出所有右边界超出视口的元素
-  byText('body *').forEach((el) => {
-    const r = el.getBoundingClientRect();
-    if (r.width === 0) return;
-    if (r.right > vw + 1.5) {
-      out.overflow.push({
-        tag: el.tagName.toLowerCase(),
-        cls: (el.className || '').toString().slice(0, 46),
-        text: (el.textContent || '').trim().slice(0, 22),
-        left: +r.left.toFixed(1),
-        right: +r.right.toFixed(1),
-        w: +r.width.toFixed(1)
-      });
+  const ws = new WebSocket(wsUrl);
+  await new Promise((r) => ws.addEventListener('open', r, { once: true }));
+  let id = 0; const pending = new Map();
+  ws.addEventListener('message', (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.id && pending.has(m.id)) {
+      const p = pending.get(m.id); pending.delete(m.id);
+      m.error ? p.reject(new Error(JSON.stringify(m.error))) : p.resolve(m.result);
     }
   });
-
-  const pick = [
-    '.hd', '.title', '#chipsHome', '#pick', '#pickEmoji', '#pickName',
-    '#pickMeta', '#pickTip', '.actions', '#btnRoll', '#btnGo',
-    '.hintline', '.footnote', '.tabbar', '.tab', '.lhead', '.grp', '.li'
-  ];
-  pick.forEach((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    out.rects[sel] = {
-      l: +r.left.toFixed(1), r: +r.right.toFixed(1),
-      w: +r.width.toFixed(1), t: +r.top.toFixed(1), b: +r.bottom.toFixed(1)
-    };
+  const send = (method, params) => new Promise((res, rej) => {
+    const mid = ++id; pending.set(mid, { resolve: res, reject: rej });
+    ws.send(JSON.stringify({ id: mid, method, params: params || {} }));
   });
+  const js = async (expr) => {
+    const r = await send('Runtime.evaluate', { expression: expr, returnByValue: true, awaitPromise: true });
+    if (r.exceptionDetails) return 'ERR: ' + (r.exceptionDetails.exception && r.exceptionDetails.exception.description);
+    return r.result.value;
+  };
 
-  // 文字是否被挤断（行数异常）
-  const tip = document.querySelector('#pickTip');
-  if (tip) {
-    out.tipInfo = {
-      scrollW: tip.scrollWidth, clientW: tip.clientWidth,
-      lines: Math.round(tip.getBoundingClientRect().height / parseFloat(getComputedStyle(tip).lineHeight || 20))
-    };
-  }
-  return out;
-})()`;
+  await send('Page.enable');
+  await send('Runtime.enable');
+  await send('Network.enable');
+  await send('Network.setBypassServiceWorker', { bypass: true });
+  await send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+  await send('Page.navigate', { url: URL_TARGET });
+  await sleep(900);
 
-(async function main() {
-  const logs = [];
+  const expr = 'JSON.stringify(' + JSON.stringify(SELS) + '.map(function(s){' +
+    'var e=document.querySelector(s);if(!e)return {sel:s,missing:true};' +
+    'var r=e.getBoundingClientRect();var c=getComputedStyle(e);' +
+    'return {sel:s,top:Math.round(r.top),h:Math.round(r.height),w:Math.round(r.width),' +
+    'display:c.display,flex:c.flex,dir:c.flexDirection,justify:c.justifyContent};}))';
+
+  const out = await js(expr);
   try {
-    const wsUrl = await getTarget();
-    const ws = new WebSocket(wsUrl);
-    let id = 0;
-    const pending = new Map();
-
-    const send = (method, params) => new Promise((resolve, reject) => {
-      const mid = ++id;
-      pending.set(mid, { resolve, reject });
-      ws.send(JSON.stringify({ id: mid, method, params: params || {} }));
-    });
-
-    await new Promise((res, rej) => {
-      ws.addEventListener('open', res, { once: true });
-      ws.addEventListener('error', rej, { once: true });
-    });
-
-    ws.addEventListener('message', (ev) => {
-      const msg = JSON.parse(ev.data);
-      if (msg.id && pending.has(msg.id)) {
-        const p = pending.get(msg.id);
-        pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
-        else p.resolve(msg.result);
-        return;
-      }
-      if (msg.method === 'Log.entryAdded') {
-        logs.push('[' + msg.params.entry.level + '] ' + msg.params.entry.text);
-      }
-      if (msg.method === 'Runtime.exceptionThrown') {
-        logs.push('[exception] ' + (msg.params.exceptionDetails.exception || {}).description);
-      }
-      if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
-        logs.push('[console.error] ' + msg.params.args.map((a) => a.value || a.description).join(' '));
-      }
-    });
-
-    await send('Page.enable');
-    await send('Log.enable');
-    await send('Runtime.enable');
-    await send('Emulation.setDeviceMetricsOverride', {
-      width: 390, height: 900, deviceScaleFactor: 2, mobile: true
-    });
-    await send('Page.navigate', { url: URL_TARGET });
-    await sleep(2000);
-
-    const res = await send('Runtime.evaluate', {
-      expression: EXPR, returnByValue: true, awaitPromise: false
-    });
-
-    console.log(JSON.stringify(res.result.value, null, 2));
-    console.log('\n--- 日志 ---');
-    console.log(logs.length ? logs.join('\n') : '（无报错）');
-
-    ws.close();
+    JSON.parse(out).forEach((x) => console.log(JSON.stringify(x)));
   } catch (e) {
-    console.error('探针失败：' + e.message);
-  } finally {
-    child.kill();
-    process.exit(0);
+    console.log(out);
   }
+
+  const doc = await js('JSON.stringify({vw:innerWidth,vh:innerHeight,sw:document.documentElement.scrollWidth,sh:document.documentElement.scrollHeight})');
+  console.log('文档: ' + doc);
+  const errs = await js('JSON.stringify(window.__errs||[])');
+  console.log('错误: ' + errs);
+
+  ws.close(); child.kill();
+  setTimeout(() => process.exit(0), 300);
 })();
