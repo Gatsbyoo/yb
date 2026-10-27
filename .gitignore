@@ -1,0 +1,17 @@
+# 开发自检产物
+_shots/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 依赖（本项目无依赖，防止误装）
+node_modules/
+
+# WorkBuddy 项目数据
+.workbuddy/
+
+# 临时文件
+*.log
